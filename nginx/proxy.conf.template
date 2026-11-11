@@ -1,0 +1,13 @@
+# 来自上游 docker/nginx/proxy.conf.template，改了一处：X-Forwarded-*。
+# 改动原因：上游直连时 nginx 是第一跳，把 $remote_addr 写进 X-Forwarded-For 是对的；
+# 这里的第一跳是核心网关，$remote_addr 是网关容器。网关按插件规范会去掉客户端伪造的
+# X-Forwarded-* 并填上真实值，所以原样透传，用户 IP、协议和端口才不会全部变成网关的。
+proxy_set_header Host $dify_request_host;
+proxy_set_header X-Forwarded-For $http_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto $http_x_forwarded_proto;
+proxy_set_header X-Forwarded-Port $http_x_forwarded_port;
+proxy_http_version 1.1;
+proxy_set_header Connection "";
+proxy_buffering off;
+proxy_read_timeout ${NGINX_PROXY_READ_TIMEOUT};
+proxy_send_timeout ${NGINX_PROXY_SEND_TIMEOUT};

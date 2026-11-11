@@ -1,29 +1,38 @@
-图标
-====
+# 素材与许可声明（NOTICE）
 
-`icon.svg` 为本仓库原创，按插件规范的线条风格手写，未用图片模型生成。从模板新建的插件换成自己的图标时，这里按实际情况重写。
+本插件包把 Dify（上游 https://github.com/langgenius/dify ）的官方容器镜像组装成云吞插件。
+镜像里的软件属于 LangGenius, Inc. 及其贡献者。
 
-许可证
-------
+## 图标
 
-MIT License
+`icon.svg` 里的图形取自上游仓库的 `web/public/logo/logo.svg`（Dify 1.19.0），
+按比例放在白色正方形底上，未改色、未变形、未与其他图形拼合。
 
-Copyright (c) 2026 Wonton plugin authors
+- 来源：https://github.com/langgenius/dify/blob/1.19.0/web/public/logo/logo.svg
+- 版权：© LangGenius, Inc.
+- 许可：Dify 的许可见下节（改过的 Apache-2.0）。上游未单独声明该 SVG 的许可，按仓库整体许可分发。
+- 商标：Dify 名称与标志是 LangGenius, Inc. 的商标。本插件是社区的第三方打包，不是 LangGenius
+  官方出品，也未获其背书。上游许可要求不得移除或修改 Dify 前端里的 LOGO 和版权信息；
+  本插件不改上游镜像、不去除任何标志。
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+## Dify 的许可（改过的 Apache License 2.0）
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Dify 按一份修改过的 Apache License 2.0 分发，附加以下条件（摘译自上游 LICENSE，
+原文见 https://github.com/langgenius/dify/blob/main/LICENSE ）：
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+1. Dify 可商用（包括作为其他应用的后端服务或企业的应用开发平台）；但出现下列任一情况，
+   需向 LangGenius 取得商业许可：
+   a. 多租户服务：除非得到 Dify 书面授权，不得用 Dify 源码运营多租户环境。Dify 的一个
+      租户对应一个工作区（workspace），工作区为每个租户提供数据和配置的隔离。
+   b. LOGO 与版权信息：使用 Dify 前端时，不得移除或修改 Dify 控制台或应用中的 LOGO 与
+      版权信息。该限制不适用于不涉及前端的用法。
+2. 贡献者需同意：生产方可按需收紧或放宽开源协议；贡献的代码可用于商业用途。
+
+除上述条件外，其余权利与限制均遵循 Apache License 2.0
+（http://www.apache.org/licenses/LICENSE-2.0 ）。该产品的交互设计受外观专利保护。
+
+## 本插件包自身的许可
+
+docker-compose.yml、nginx/、squid/ 下的适配文件、README 等属于本仓库，按仓库根目录的
+LICENSE（MIT）分发。清单里的 `license` 字段写的是上游应用 Dify 的许可证
+（SPDX：LicenseRef-Dify-Modified-Apache-2.0，即本节的改版 Apache-2.0）。

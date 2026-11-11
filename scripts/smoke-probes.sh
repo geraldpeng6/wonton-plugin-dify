@@ -4,58 +4,156 @@
 # 变量别叫 state：shellcheck 把这份文件连着 probes.sh 一起分析，probes.sh 自己也读一个 dev.sh 提供的 state；
 # 子壳体函数（fn() ( … )）里给 state 赋值，SC2031 就报在 probes.sh 上，CI 红。
 #
-# 变量：SMOKE_WEB_URL 是应用的网页入口（套件已去尾斜杠，但可能带路径，比如 SSO 登录页）；
-#       拼 API 路径用 SMOKE_WEB_ORIGIN（只有 scheme://host:port，入口的路径不掺进来），别直接接在 SMOKE_WEB_URL 后面。
-#
+# Dify 是 sso: none：网关会话之外还有应用自己的账号。探针走和用户第一次打开时同一条接口注册/登录
+# 管理员（POST /console/api/setup、/console/api/login），再调应用自己的接口断言身份和数据。
+# 管理员凭据记录在 $SMOKE_STATE 的 dify-admin= 行里，data_write / data_check 复用同一账号；
+# SMOKE_STATE 整份由套件保存，其他文件不做这个保证。
 # 页面：web_assert 从标准输入读页面，命中的确是应用的真实页面时返回 0。
-# 身份：identity_check 只证明身份：用应用自己的“当前用户”接口断言认出的是用户管理员，不碰应用里的数据。
-#       数据断言（是否配置过、有几条、内容对不对）全部交给 data_write / data_check：冒烟第 1 项会先装升级
-#       起点写数据，身份探针再断言“数据目录是空的”就会红。接口回字段时也只看类型（如 configured 是布尔、
-#       nodes 是数字），值和条数留给 data_check。
-#       没有用户体系时写 IDENTITY_NA=1，并在 SMOKE_NOTE 里写原因。dweb / web_get 是带用户会话的请求助手，可继续走应用自己的登录链。
-#       SSO 登录跳转不用自己写表单逻辑：dweb --sso 会从清单 webui.path 的入口出发（没写就是 /），提交核心
-#       登录页的 JS 自动表单并跟完重定向，返回的页面已带应用的登录态。
-# 工具：MCP_TOOL 写一个只读工具名（可带插件前缀），MCP_ARGS 是 JSON 参数；mcp_assert 从标准输入读调用结果。
-#       要断言多个工具时改成写 mcp_check；调用前要备数据时写 before_mcp。
-# 通知房间：申请了 notify 的插件把通知交给核心，核心以核心账号发进和主人的“Wonton”私聊。
-#       探针以主人身份读这个房间：probes_owner_room_wait <超时秒> <要找的文字> 等到开始之后发来的、包含这段文字的
-#       消息就返回 0，超时列出看到的最新消息并返回非 0。要先把等待挂到后台再发通知，否则消息可能在等待开始前就到：
-#         room_wait() {
-#           local marker="probe-$RANDOM" url
-#           url="$(docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" printenv WONTON_NOTIFY_URL)"
-#           probes_owner_room_wait 120 "$marker" & local pid=$!
-#           docker exec "wonton-$SMOKE_INSTANCE--${SMOKE_PLUGIN_ID//./-}--web" wget -q -O /dev/null \
-#             --header 'Content-Type: application/json' --post-data "{\"title\":\"$marker\"}" "$url"
-#           wait "$pid"
-#         }
-#       上面的 web 换成插件里能发 HTTP 的服务；wget 换成那个服务里有的客户端。
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：data_write 用随机标记写
-#       一条数据并把标记原样存进 $SMOKE_STATE，data_check 读回标记去应用里找，对不上就打印看到了什么并返回非 0。
-#       应用不存用户数据时写 DATA_NA=1（两项记 N/A）。
-# 装之前要准备（如先配出口代理）：写 before_install。
+# 身份：identity_check 只证明身份：登录后调应用的 account/profile，断言认出的就是注册的管理员。
+# 数据：data_write 建一个带随机标记的应用（POST /console/api/apps），把标记写进 $SMOKE_STATE；
+#       data_check 登录后在应用列表里找回这个标记。
+# 工具：清单没有 mcp（Dify 不提供 MCP 服务端），这一项由套件按清单自动记 N/A。
+# 通知：notify 权限接的是核心发信（SMTP），只发给家里人；探针不等房间消息。
 
-web_assert() { grep -q '你好'; }   # 示例页的标题
+# 应用控制台 API 的基地址（经核心网关）。
+_dify_api() { printf '%s/console/api' "$SMOKE_WEB_ORIGIN"; }
 
-identity_check() { # 页面回显的就是网关注入的用户名；示例页不存数据，也不拿数据判断身份
-  local page
-  page="$(dweb /)" || { echo "页面失败：$page"; return 1; }
-  grep -qF "你好，$SMOKE_OWNER" <<<"$page" || { echo "页面没回显用户 $SMOKE_OWNER：$(head -c 120 <<<"$page")"; return 1; }
+# 带核心会话 + Dify 自己会话的 curl。Dify 的 cookie 存独立 jar，不污染套件的核心会话 jar。
+_dify_curl() {
+  local jar="$1"; shift
+  curl -fsS --noproxy '*' -b "$SMOKE_JAR" -b "$jar" -c "$jar" "$@"
 }
 
-# 数据：合并前要验证“升级/重装不丢用户数据”时写 data_write 和 data_check（两个都写才跑）：
-#   data_write 用随机标记写一条数据，把标记原样覆盖写进 $SMOKE_STATE（一个已建好的空文件，不是目录）；data_check 读回标记、去应用里找，
-#   找不到就打印看到了什么并返回非 0。
-# 应用不存用户数据时写 DATA_NA=1（两项记 N/A）。模板的示例页不存数据，所以这里是不适用。
-# 数据要写进插件容器时（Agent 插件的工作区标记等），容器名别自己拼：钩子契约里没有 SMOKE_SLUG，e2e 套件的
-# data_write 又跑在实例名导出之前，拼出来的名字缺段（No such container）；Bot 服务（清单声明了 bots）每个 Bot
-# 一组容器，名字还带 --<Bot 名> 后缀。按核心打的标签找，插件自带 smoke 和 e2e 套件两个运行环境都成立
-# （实例名没导出时按 SMOKE_BASE 的主机名第一段推）：
-#   _container() { # <插件 id> <服务名>：本实例里这个服务的容器
-#     local inst="${SMOKE_INSTANCE:-}" args=(--filter "label=wonton.plugin=$1" --filter "label=wonton.service=$2")
-#     if [[ -z "$inst" && -n "${SMOKE_BASE:-}" ]]; then
-#       inst="${SMOKE_BASE#http://}"; inst="${inst%%.*}"
-#     fi
-#     [[ -z "$inst" ]] || args+=(--filter "label=wonton.instance=${inst//-/}")
-#     docker ps --format '{{.Names}}' "${args[@]}" | head -1
-#   }
-export DATA_NA=1
+_dify_jar() {
+  mktemp "${SMOKE_STATE%/*}/dify-jar-XXXXXX"
+}
+
+# 从 cookie jar（Netscape 格式，tab 分隔）里取一个 cookie 的值。
+_dify_cookie() { # <jar> <名字>
+  awk -F'\t' -v n="$2" '$6 == n {v = $7} END {print v}' "$1"
+}
+
+# 从 $SMOKE_STATE 读 dify-admin=邮箱:密码（没有就输出空）。
+_dify_creds_read() {
+  grep -m1 '^dify-admin=' "$SMOKE_STATE" 2>/dev/null | cut -d= -f2-
+}
+
+# 生成一份合法的管理员凭据（Dify 密码要求字母加数字、8 位以上）。
+_dify_creds_make() {
+  local rand
+  rand="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  printf 'probe-%s@wonton.internal:pw-%s' "$rand" "$rand"
+}
+
+# 没设置过就注册管理员（幂等：已设置直接跳过）。
+_dify_ensure_setup() {
+  local jar step creds body
+  jar="$(_dify_jar)" || return 1
+  step="$(_dify_curl "$jar" "$(_dify_api)/setup" | jq -r .step)" || {
+    echo "读 /console/api/setup 失败"
+    rm -f "$jar"
+    return 1
+  }
+  if [[ "$step" == "not_started" ]]; then
+    creds="$(_dify_creds_read)"
+    [[ -n "$creds" ]] || creds="$(_dify_creds_make)"
+    body="$(jq -rn --arg creds "$creds" '($creds | split(":")) as $p |
+      {email:$p[0], name:"probe", password:$p[1], language:"zh-Hans"} | tojson')"
+    if ! _dify_curl "$jar" -X POST "$(_dify_api)/setup" \
+        -H 'Content-Type: application/json' -d "$body" >/dev/null; then
+      echo "注册管理员失败（POST /console/api/setup）"
+      rm -f "$jar"
+      return 1
+    fi
+    # 记下凭据：SMOKE_STATE 里已有就不再追加（幂等）。
+    [[ -n "$(_dify_creds_read)" ]] || printf 'dify-admin=%s\n' "$creds" >>"$SMOKE_STATE"
+  elif [[ -z "$(_dify_creds_read)" ]]; then
+    echo "应用已设置过管理员，但 SMOKE_STATE 里没有凭据，无法登录"
+    rm -f "$jar"
+    return 1
+  fi
+  rm -f "$jar"
+}
+
+# 登录应用，往 jar 里写 Dify 的会话 cookie。请求本身带套件的核心会话，网关才放行。
+_dify_login() { # <jar>
+  local jar="$1" creds body
+  creds="$(_dify_creds_read)"
+  if [[ -z "$creds" ]]; then
+    echo "SMOKE_STATE 里没有 dify-admin= 凭据（identity_check 应先跑）"
+    return 1
+  fi
+  body="$(jq -rn --arg creds "$creds" '($creds | split(":")) as $p |
+    {email:$p[0], PASSWORD:$p[1], remember_me:true} | tojson')"
+  _dify_curl "$jar" -X POST "$(_dify_api)/login" \
+    -H 'Content-Type: application/json' -d "$body" >/dev/null || {
+    echo "登录失败（POST /console/api/login），账号：${creds%%:*}"
+    return 1
+  }
+  grep -q 'access_token' "$jar" || { echo "登录响应里没有会话 cookie"; return 1; }
+}
+
+web_assert() { grep -q 'Dify'; }
+
+identity_check() {
+  local jar profile email expected rc=0
+  _dify_ensure_setup || return 1
+  jar="$(_dify_jar)" || return 1
+  _dify_login "$jar" || { rm -f "$jar"; return 1; }
+  if ! profile="$(_dify_curl "$jar" "$(_dify_api)/account/profile")"; then
+    echo "account/profile 请求失败"
+    rc=1
+  else
+    email="$(jq -r '.email // empty' <<<"$profile")"
+    expected="$(_dify_creds_read | cut -d: -f1)"
+    if [[ -z "$email" ]]; then
+      echo "account/profile 没回 email：$(head -c 200 <<<"$profile")"
+      rc=1
+    elif [[ "$email" != "$expected" ]]; then
+      echo "认出的账号不是注册的管理员：$email != $expected"
+      rc=1
+    fi
+  fi
+  rm -f "$jar"
+  return "$rc"
+}
+
+data_write() {
+  local jar marker body app_id
+  _dify_ensure_setup || return 1
+  jar="$(_dify_jar)" || return 1
+  _dify_login "$jar" || { rm -f "$jar"; return 1; }
+  marker="probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+  body="$(jq -rn --arg marker "$marker" '{name:$marker, mode:"chat"} | tojson')"
+  # cookie 登录的写请求要带 X-CSRFToken（值就是登录时种下的 csrf_token cookie）。
+  app_id="$(_dify_curl "$jar" -X POST "$(_dify_api)/apps" \
+    -H 'Content-Type: application/json' \
+    -H "X-CSRFToken: $(_dify_cookie "$jar" csrf_token)" \
+    -d "$body" | jq -r '.id // empty')" || app_id=""
+  if [[ -z "$app_id" ]]; then
+    echo "创建应用失败（POST /console/api/apps）"
+    rm -f "$jar"
+    return 1
+  fi
+  # 覆盖写：保住 dify-admin= 行（data_check 还要用同一账号登录），再写标记。
+  { _dify_creds_read | sed 's/^/dify-admin=/'; printf 'marker=%s\napp-id=%s\n' "$marker" "$app_id"; } >"$SMOKE_STATE"
+  rm -f "$jar"
+}
+
+data_check() {
+  local jar marker names
+  marker="$(grep -m1 '^marker=' "$SMOKE_STATE" | cut -d= -f2-)"
+  if [[ -z "$marker" ]]; then
+    echo "SMOKE_STATE 里没有标记（data_write 应先跑）：$(head -c 120 "$SMOKE_STATE" 2>/dev/null)"
+    return 1
+  fi
+  jar="$(_dify_jar)" || return 1
+  _dify_login "$jar" || { rm -f "$jar"; return 1; }
+  names="$(_dify_curl "$jar" "$(_dify_api)/apps?page=0&limit=100" | jq -r '.data[]?.name // empty' 2>/dev/null)" || names=""
+  rm -f "$jar"
+  if grep -qxF "$marker" <<<"$names"; then
+    return 0
+  fi
+  echo "应用列表里找不到标记 $marker，看到的：$(printf '%s' "$names" | head -5 | paste -sd, -)"
+  return 1
+}
