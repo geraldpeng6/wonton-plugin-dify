@@ -42,6 +42,10 @@ acl CONNECT method CONNECT
 
 ################################## Common Parameters ################################
 
+# 云吞给插件的容器默认去掉 NET_RAW（插件规范），squid 起不来 ICMP pinger 会直接 FATAL 退出；
+# SSRF 代理不需要 ICMP，按 squid 自带的开关关掉（上游部署靠 Docker 默认的 NET_RAW 跑着）。
+pinger_enable off
+
 tcp_outgoing_address 0.0.0.0
 
 ################################## Proxy Server ################################

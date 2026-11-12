@@ -19,6 +19,9 @@
 _dify_api() { printf '%s/console/api' "$SMOKE_WEB_ORIGIN"; }
 
 # 带核心会话 + Dify 自己会话的 curl。Dify 的 cookie 存独立 jar，不污染套件的核心会话 jar。
+# 注意：cookie 认证的请求要带 X-CSRF-Token（= 登录种的 csrf_token cookie，api/constants/__init__.py），
+# 而且只能带一次——同一请求带两份同名头，WSGI 合并成 "值,值"，服务端就当 CSRF 不匹配（实测 401）。
+# 所以这里不自动加，调用处按需自己写一个。
 _dify_curl() {
   local jar="$1"; shift
   curl -fsS --noproxy '*' -b "$SMOKE_JAR" -b "$jar" -c "$jar" "$@"
@@ -84,7 +87,9 @@ _dify_login() { # <jar>
     return 1
   fi
   body="$(jq -rn --arg creds "$creds" '($creds | split(":")) as $p |
-    {email:$p[0], PASSWORD:$p[1], remember_me:true} | tojson')"
+    {email:$p[0], password:($p[1] | @base64), remember_me:true} | tojson')"
+  # Dify 1.19 的登录接口把 password 当 base64 解码（网页端先编码再发；setup 收的是原文，键名也是原文 password），
+  # 见 api/libs/encryption.py 和 controllers/console/wraps.py 的 decrypt_password_field。
   _dify_curl "$jar" -X POST "$(_dify_api)/login" \
     -H 'Content-Type: application/json' -d "$body" >/dev/null || {
     echo "登录失败（POST /console/api/login），账号：${creds%%:*}"
@@ -100,7 +105,9 @@ identity_check() {
   _dify_ensure_setup || return 1
   jar="$(_dify_jar)" || return 1
   _dify_login "$jar" || { rm -f "$jar"; return 1; }
-  if ! profile="$(_dify_curl "$jar" "$(_dify_api)/account/profile")"; then
+  # cookie 认证的读请求也要 CSRF（实测 GET /account/profile 缺了报 401）。
+  if ! profile="$(_dify_curl "$jar" -H "X-CSRF-Token: $(_dify_cookie "$jar" csrf_token)" \
+    "$(_dify_api)/account/profile")"; then
     echo "account/profile 请求失败"
     rc=1
   else
@@ -125,18 +132,22 @@ data_write() {
   _dify_login "$jar" || { rm -f "$jar"; return 1; }
   marker="probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
   body="$(jq -rn --arg marker "$marker" '{name:$marker, mode:"chat"} | tojson')"
-  # cookie 登录的写请求要带 X-CSRFToken（值就是登录时种下的 csrf_token cookie）。
-  app_id="$(_dify_curl "$jar" -X POST "$(_dify_api)/apps" \
+  # cookie 登录的写请求要带 X-CSRF-Token（值就是登录时种下的 csrf_token cookie）。
+  # 带上响应正文一起诊断：失败时 jq 取不到 id，把原文打进日志（401/422 的 message 写得很具体）。
+  app_resp="$(_dify_curl "$jar" -X POST "$(_dify_api)/apps" \
     -H 'Content-Type: application/json' \
-    -H "X-CSRFToken: $(_dify_cookie "$jar" csrf_token)" \
-    -d "$body" | jq -r '.id // empty')" || app_id=""
+    -H "X-CSRF-Token: $(_dify_cookie "$jar" csrf_token)" \
+    -d "$body" || true)"
+  app_id="$(jq -r '.id // empty' <<<"$app_resp")"
   if [[ -z "$app_id" ]]; then
-    echo "创建应用失败（POST /console/api/apps）"
+    echo "创建应用失败（POST /console/api/apps）：$(head -c 300 <<<"$app_resp")"
     rm -f "$jar"
     return 1
   fi
   # 覆盖写：保住 dify-admin= 行（data_check 还要用同一账号登录），再写标记。
-  { _dify_creds_read | sed 's/^/dify-admin=/'; printf 'marker=%s\napp-id=%s\n' "$marker" "$app_id"; } >"$SMOKE_STATE"
+  # 先读后写：重定向先截断文件，_dify_creds_read 再读就只剩空（实测凭据行会丢）。
+  creds_line="$(_dify_creds_read | sed 's/^/dify-admin=/')"
+  { [[ -n "$creds_line" ]] && printf '%s\n' "$creds_line"; printf 'marker=%s\napp-id=%s\n' "$marker" "$app_id"; } >"$SMOKE_STATE"
   rm -f "$jar"
 }
 
@@ -149,7 +160,8 @@ data_check() {
   fi
   jar="$(_dify_jar)" || return 1
   _dify_login "$jar" || { rm -f "$jar"; return 1; }
-  names="$(_dify_curl "$jar" "$(_dify_api)/apps?page=0&limit=100" | jq -r '.data[]?.name // empty' 2>/dev/null)" || names=""
+  names="$(_dify_curl "$jar" -H "X-CSRF-Token: $(_dify_cookie "$jar" csrf_token)" \
+    "$(_dify_api)/apps?page=1&limit=100" | jq -r '.data[]?.name // empty' 2>/dev/null)" || names=""
   rm -f "$jar"
   if grep -qxF "$marker" <<<"$names"; then
     return 0

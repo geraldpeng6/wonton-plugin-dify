@@ -6,7 +6,7 @@
 
 ## 服务构成
 
-以上游 [`docker/docker-compose.yaml`](https://github.com/langgenius/dify/blob/1.19.0/docker/docker-compose.yaml)（tag `1.19.0`）默认 profile 的服务为准：`db_postgres`、`redis`、`pgvector`、`api`、`api_websocket`、`worker`、`worker_beat`、`web`、`nginx`、`sandbox`、`ssrf_proxy`、`plugin_daemon`、`agent_backend`、`agent_ssrf_proxy`、`local_sandbox`。上游 compose 里其余的向量库、MySQL、Milvus/Elasticsearch 等可选项不打包，需要外接时在上游支持的环境变量里自行配置。逐项改写对照（上游写法 → 我们的写法 → 原因）见 PR 描述。
+以上游 [`docker/docker-compose.yaml`](https://github.com/langgenius/dify/blob/1.19.0/docker/docker-compose.yaml)（tag `1.19.0`）默认 profile 的服务为基准：`db_postgres`、`redis`、`pgvector`、`api`、`api_websocket`、`worker`、`worker_beat`、`web`、`nginx`、`sandbox`、`ssrf_proxy`、`plugin_daemon` 都在；Agent 应用引擎三件（`agent_backend`、`agent_ssrf_proxy`、`local_sandbox`）没打包——它的启动密钥格式（无填充 base64url、32 字节）和云吞密钥的两种编码（hex、base64）都对不上，装不上就起不来，见 PR「底座的问题」。聊天机器人、Chatflow、工作流、知识库应用不受影响；「Agent」类型的编排（Agent 策略节点、Agent 的 shell 工具）在云吞版暂不可用。上游 compose 里其余的向量库、MySQL、Milvus/Elasticsearch 等可选项不打包，需要外接时在上游支持的环境变量里自行配置。逐项改写对照（上游写法 → 我们的写法 → 原因）见 PR 描述。
 
 ## 图标
 

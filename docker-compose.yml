@@ -80,9 +80,6 @@ services:
       PLUGIN_DIFY_INNER_API_URL: http://api:5001
       PLUGIN_DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
       INNER_API_KEY_FOR_PLUGIN: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
-      AGENT_BACKEND_BASE_URL: http://agent-backend:5050
-      DIFY_AGENT_API_TOKEN: ${WONTON_SECRET_AGENT_API_TOKEN}
-      AGENT_BACKEND_API_TOKEN: ${WONTON_SECRET_AGENT_API_TOKEN}
       VECTOR_STORE: pgvector
       PGVECTOR_HOST: pgvector
       PGVECTOR_PORT: "5432"
@@ -107,8 +104,6 @@ services:
       db:
         condition: service_healthy
       redis:
-        condition: service_started
-      agent-backend:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
@@ -193,9 +188,6 @@ services:
       PLUGIN_DIFY_INNER_API_URL: http://api:5001
       PLUGIN_DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
       INNER_API_KEY_FOR_PLUGIN: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
-      AGENT_BACKEND_BASE_URL: http://agent-backend:5050
-      DIFY_AGENT_API_TOKEN: ${WONTON_SECRET_AGENT_API_TOKEN}
-      AGENT_BACKEND_API_TOKEN: ${WONTON_SECRET_AGENT_API_TOKEN}
       VECTOR_STORE: pgvector
       PGVECTOR_HOST: pgvector
       PGVECTOR_PORT: "5432"
@@ -217,8 +209,6 @@ services:
         condition: service_healthy
       redis:
         condition: service_started
-      agent-backend:
-        condition: service_started
     healthcheck:
       # 上游声明的就是这个检查，只是默认用 COMPOSE_WORKER_HEALTHCHECK_DISABLED 关着；这里打开。
       # interval 给到 60s：每次检查都要起一个 Python 进程，别太频繁。
@@ -236,9 +226,13 @@ services:
     user: "1001:1001"
     environment:
       MODE: beat
-      MIGRATION_ENABLED: "true"
+      # 数据库迁移只让 api 做（上游 worker 也显式关掉）；beat 开着会抢迁移锁，它的 redis 配置不全就撞 localhost。
+      MIGRATION_ENABLED: "false"
       SECRET_KEY: ${WONTON_SECRET_DIFY_SECRET_KEY}
       CELERY_BROKER_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/1
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
     depends_on:
       db:
         condition: service_healthy
@@ -263,8 +257,13 @@ services:
       MARKETPLACE_URL: https://marketplace.dify.ai
       # 协同的 WebSocket 也走同源网关；上游默认 ws://localhost 只适合本机访问。
       NEXT_PUBLIC_SOCKET_URL: ${WONTON_APP_URL}
+      # Next.js 独立服务读 HOSTNAME 当绑定地址，Docker 默认的 HOSTNAME 是容器名，只绑了容器 IP；
+      # 健康检查要打 127.0.0.1，显式绑全部网卡。上游没设这项（它没有健康检查，一直没人发现）。
+      HOSTNAME: 0.0.0.0
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/"]
+      # 首次打开前 web 的页面是「未初始化」错误页（500），注册管理员后才是 200；健康检查只证明 HTTP 在应答，
+      # 不挑状态码。镜像的 sh 是 dash，没有 /dev/tcp，用它自带的 node。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(()=>process.exit(0),()=>process.exit(1))"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -316,7 +315,11 @@ services:
       HTTPS_PROXY: http://ssrf-proxy:3128
     volumes:
       - ${WONTON_APP_DATA}/sandbox/dependencies:/dependencies
-      - ${WONTON_APP_DATA}/sandbox/conf:/conf
+    configs:
+      # 上游把这个 config.yaml 放在 docker/volumes/sandbox/conf/ 里随仓库分发，内容原样；
+      # key 会被环境变量 API_KEY 覆盖成核心生成的密钥，文件里不落密钥。
+      - source: sandbox-conf
+        target: /conf/config.yaml
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8194/health"]
       interval: 30s
@@ -363,6 +366,16 @@ services:
       DB_SSL_MODE: disable
       SERVER_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
       SERVER_PORT: "5002"
+      # 上游 defaults 里三项：守护进程记录"远程安装宿主"用的地址和端口，Go 端没默认值，缺了起不来（实测报
+      # "plugin remote installing host is empty"）；working path 同理（报 "plugin working path is empty"）。
+      # 0.0.0.0 是上游 PLUGIN_DEBUGGING_HOST 的默认。
+      PLUGIN_REMOTE_INSTALLING_HOST: 0.0.0.0
+      PLUGIN_REMOTE_INSTALLING_PORT: "5003"
+      PLUGIN_WORKING_PATH: /app/storage/cwd
+      # 上游经 env_file 的 databases/redis.env 给它；没有这几项它按空主机名去连 redis（实测 dial tcp :0）。
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
       DIFY_INNER_API_URL: http://api:5001
       DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
     volumes:
@@ -378,83 +391,6 @@ services:
       start_period: 30s
       start_interval: 2s
 
-  # Dify Agent 的运行后端（Agent 应用的执行引擎，api 硬依赖）。
-  agent-backend:
-    image: langgenius/dify-agent-backend:1.19.0@sha256:005e04e83a54623fff131072000e76e99480aabc2773a08e848cc8aabf2eaf4c
-    environment:
-      DIFY_AGENT_API_TOKEN: ${WONTON_SECRET_AGENT_API_TOKEN}
-      DIFY_AGENT_REDIS_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/2
-      DIFY_AGENT_PLUGIN_DAEMON_URL: http://plugin-daemon:5002
-      DIFY_AGENT_PLUGIN_DAEMON_API_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
-      DIFY_AGENT_INNER_API_URL: http://api:5001
-      DIFY_AGENT_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
-      DIFY_AGENT_LOCAL_SANDBOX_AUTH_TOKEN: ${WONTON_SECRET_AGENT_SANDBOX_TOKEN}
-      DIFY_AGENT_SERVER_SECRET_KEY: ${WONTON_SECRET_AGENT_SERVER_KEY}
-      # 上游默认值引用它自己的服务名（local_sandbox / agent_backend），这里的服务名改成了连字符。
-      DIFY_AGENT_LOCAL_SANDBOX_ENDPOINT: http://local-sandbox:5004
-      DIFY_AGENT_SANDBOX_FILES_BASE_URL: http://api:5001
-      DIFY_AGENT_STUB_API_BASE_URL: http://agent-backend:5050/agent-stub
-    depends_on:
-      redis:
-        condition: service_started
-      plugin-daemon:
-        condition: service_started
-    healthcheck:
-      # 镜像没装 curl，用自带的 Python。FastAPI 默认开放 /openapi.json。
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/openapi.json')"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
-      start_interval: 2s
-
-  # Agent 本地沙箱的专用代理：只放行 agent-backend 的 /agent-stub/ 和 api 的 /files/。
-  agent-ssrf-proxy:
-    image: ubuntu/squid:6.6-24.04_beta@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
-    entrypoint: ["/bin/bash", "/squid-entrypoint.sh"]
-    environment:
-      HTTP_PORT: "3128"
-      COREDUMP_DIR: /var/spool/squid
-    configs:
-      - source: squid-agent-conf
-        target: /etc/squid/squid.conf.template
-      - source: squid-common
-        target: /etc/squid/dify_common.conf.template
-      - source: squid-entrypoint
-        target: /squid-entrypoint.sh
-    healthcheck:
-      test: ["CMD-SHELL", "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128 && printf \"GET cache_object://localhost/counters HTTP/1.0\\r\\n\\r\\n\" >&3 && head -1 <&3 | grep -q \" 200 \"'"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-      start_interval: 2s
-
-  # Agent 本地沙箱：shellctl 服务，跑 Agent 的 shell 工具；出网只经 agent-ssrf-proxy。
-  local-sandbox:
-    image: langgenius/dify-agent-local-sandbox:1.19.0@sha256:ae762c685009e5a7d036be3bd903724f697d92ca4c17256398c1a2caaa64140c
-    command: ["shellctl", "serve", "--listen", "0.0.0.0:5004", "--require-auth-token"]
-    environment:
-      SHELLCTL_AUTH_TOKEN: ${WONTON_SECRET_AGENT_SANDBOX_TOKEN}
-      HTTP_PROXY: http://agent-ssrf-proxy:3128
-      HTTPS_PROXY: http://agent-ssrf-proxy:3128
-      NO_PROXY: localhost,127.0.0.1
-    volumes:
-      - agent-sandbox-home:/home/dify
-      - agent-sandbox-workspace:/workspace
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5004/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-      start_interval: 2s
-
-volumes:
-  # Agent 沙箱的家目录和工作区（上游同名命名卷；docker 首次挂载时按镜像内属主初始化）。
-  agent-sandbox-home:
-  agent-sandbox-workspace:
-
 configs:
   nginx-conf:
     file: ./nginx/nginx.conf.template
@@ -466,12 +402,25 @@ configs:
     file: ./nginx/entrypoint.sh
   squid-conf:
     file: ./squid/squid.conf.template
-  squid-agent-conf:
-    file: ./squid/agent.conf.template
   squid-common:
     file: ./squid/common.conf.template
   squid-entrypoint:
     file: ./squid/entrypoint.sh
+  sandbox-conf:
+    content: |
+      app:
+        port: 8194
+        debug: True
+        key: dify-sandbox
+      max_workers: 4
+      max_requests: 50
+      worker_timeout: 5
+      enable_network: True # please make sure there is no network risk in your environment
+      allowed_syscalls: # please leave it empty if you have no idea how seccomp works
+      proxy:
+        socks5: ''
+        http: ''
+        https: ''
 
 x-wonton:
   spec: "0.12"
@@ -535,12 +484,6 @@ x-wonton:
     plugin_inner_api_key:
       generate: { bytes: 32 }
     sandbox_api_key:
-      generate: { bytes: 32 }
-    agent_api_token:
-      generate: { bytes: 32 }
-    agent_sandbox_token:
-      generate: { bytes: 32 }
-    agent_server_key:
       generate: { bytes: 32 }
   requirements:
     arch: [amd64, arm64]
