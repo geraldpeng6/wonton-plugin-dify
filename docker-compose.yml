@@ -1,78 +1,491 @@
-# 示例插件：nginx 显示一个网页，向登录的人问好。改成自己的应用见 https://github.com/wontonapp/wonton-docs/blob/main/develop.md#写插件。
+# Dify：LLM 应用平台（拖拽编排助手、知识库问答）。服务构成以上游 docker/docker-compose.yaml
+# 的默认 profile（weaviate,postgresql,collaboration）为准，逐项改写见 PR 的改写清单。
+# 密码和密钥全部来自清单 secrets（上游默认值里有写死的公共凭据，这里换成每个安装独立生成）。
 services:
-  web:
-    # 镜像按摘要固定（多架构镜像写清单列表的摘要），标签只给人看。
-    image: nginx:1.31.8-alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
+  # 主数据库：工作区、应用、对话都在这里。上游镜像 postgres:15-alpine。
+  db:
+    image: postgres:15-alpine@sha256:eab009ce9447a891d9482702d370bbf132c18563bb87cfdcc2b815c6d3b0372f
     environment:
-      # 网关代登录：SSI 回显的 Remote-User 只信核心带来的。官方镜像启动时对 templates 目录里的
-      # *.template 做 envsubst，把下面的地址换进 nginx 配置（见 web/default.conf.template）。
-      WONTON_CORE_ADDRESS: ${WONTON_CORE_ADDRESS}
-    # 包里的文件经 configs 交给容器（核心在启动前写进去），不能用卷挂载。
-    configs:
-      - source: site
-        target: /etc/nginx/templates/default.conf.template
-      - source: page
-        target: /usr/share/nginx/html/index.html
-      - source: tokens
-        target: /usr/share/nginx/html/tokens.css
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${WONTON_SECRET_POSTGRES_PASSWORD}
+      POSTGRES_DB: dify
+      # 上游 db-postgres.defaults 把 PGDATA 指进挂载目录的子目录，避开 bind mount 根上的 lost+found。
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${WONTON_APP_DATA}/db:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      test: ["CMD-SHELL", "pg_isready -h db -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # Celery 的消息队列。redis-cli 靠 REDISCLI_AUTH 带上密码（上游 redis.defaults 的做法）。
+  redis:
+    image: redis:6-alpine@sha256:bb3686b504e6780e6878f187f1b8275236183d7ef514a248802f60106adf571a
+    command: ["sh", "-c", "exec docker-entrypoint.sh redis-server --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+      REDISCLI_AUTH: ${WONTON_SECRET_REDIS_PASSWORD}
+    volumes:
+      - ${WONTON_APP_DATA}/redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+
+  # 向量库：知识库检索用。选 pgvector 不选上游默认的 weaviate：空闲内存更低，pg_isready 自带健康检查，
+  # 两者都是上游 compose 里现成的选项（pgvector.defaults）。
+  pgvector:
+    image: pgvector/pgvector:pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${WONTON_SECRET_PGVECTOR_PASSWORD}
+      POSTGRES_DB: dify
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ${WONTON_APP_DATA}/pgvector:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  # API/控制台后端。dify-api 镜像以 uid 1001（dify）运行，user 要和它一致，数据目录属主才是它。
+  api:
+    image: langgenius/dify-api:1.19.0@sha256:0d67842aedcb9b5884f75b88c4a5dd812e637916bff1ca892831f7ace2f3204f
+    user: "1001:1001"
+    environment:
+      MODE: api
+      MIGRATION_ENABLED: "true"
+      SECRET_KEY: ${WONTON_SECRET_DIFY_SECRET_KEY}
+      # api.defaults：信任网关传来的 X-Forwarded-*（见 nginx/proxy.conf.template 的说明）。
+      RESPECT_XFORWARD_HEADERS_ENABLED: "true"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${WONTON_SECRET_POSTGRES_PASSWORD}
+      DB_DATABASE: dify
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/1
+      # 工具类节点和沙箱的外网请求都走上游的 SSRF 代理（squid）。
+      SSRF_PROXY_HTTP_URL: http://ssrf-proxy:3128
+      SSRF_PROXY_HTTPS_URL: http://ssrf-proxy:3128
+      CODE_EXECUTION_ENDPOINT: http://sandbox:8194
+      CODE_EXECUTION_API_KEY: ${WONTON_SECRET_SANDBOX_API_KEY}
+      PLUGIN_DAEMON_URL: http://plugin-daemon:5002
+      PLUGIN_DAEMON_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
+      PLUGIN_DIFY_INNER_API_URL: http://api:5001
+      PLUGIN_DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      INNER_API_KEY_FOR_PLUGIN: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      VECTOR_STORE: pgvector
+      PGVECTOR_HOST: pgvector
+      PGVECTOR_PORT: "5432"
+      PGVECTOR_USER: postgres
+      PGVECTOR_PASSWORD: ${WONTON_SECRET_PGVECTOR_PASSWORD}
+      PGVECTOR_DATABASE: dify
+      STORAGE_TYPE: opendal
+      OPENDAL_FS_ROOT: storage
+      # 邮件（找回密码、邀请成员）走核心的发信服务。
+      MAIL_TYPE: smtp
+      SMTP_SERVER: ${WONTON_SMTP_HOST}
+      SMTP_PORT: ${WONTON_SMTP_PORT}
+      SMTP_USE_TLS: "false"
+      SMTP_OPPORTUNISTIC_TLS: "false"
+      MAIL_DEFAULT_SEND_FROM: ${WONTON_MAIL_FROM}
+      # 首个注册的管理员会自动装上这个市场插件（异步，装失败不影响注册）：
+      # OpenAI-API-compatible 供应商，README 里说明怎么把它指向模型网关或自己的服务商。
+      NEW_USER_DEFAULT_PLUGIN_IDS: langgenius/openai_api_compatible
+    volumes:
+      - ${WONTON_APP_DATA}/storage:/app/api/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/health"]
       interval: 30s
       timeout: 5s
+      retries: 3
+      start_period: 90s
+      start_interval: 3s
+
+  # 工作流实时协同（上游 collaboration profile，1.19 默认开启）。同一镜像，换 websocket worker 类启动。
+  api-websocket:
+    image: langgenius/dify-api:1.19.0@sha256:0d67842aedcb9b5884f75b88c4a5dd812e637916bff1ca892831f7ace2f3204f
+    user: "1001:1001"
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        export SERVER_WORKER_AMOUNT="$${API_WEBSOCKET_WORKER_AMOUNT:-1}"
+        export SERVER_WORKER_CLASS="$${API_WEBSOCKET_WORKER_CLASS:-geventwebsocket.gunicorn.workers.GeventWebSocketWorker}"
+        export SERVER_WORKER_CONNECTIONS="$${API_WEBSOCKET_WORKER_CONNECTIONS:-1000}"
+        export GUNICORN_TIMEOUT="$${API_WEBSOCKET_GUNICORN_TIMEOUT:-360}"
+        exec /bin/bash /entrypoint.sh
+    environment:
+      MODE: api
+      MIGRATION_ENABLED: "true"
+      SECRET_KEY: ${WONTON_SECRET_DIFY_SECRET_KEY}
+      RESPECT_XFORWARD_HEADERS_ENABLED: "true"
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${WONTON_SECRET_POSTGRES_PASSWORD}
+      DB_DATABASE: dify
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/1
+      PLUGIN_DAEMON_URL: http://plugin-daemon:5002
+      PLUGIN_DAEMON_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
+      PLUGIN_DIFY_INNER_API_URL: http://api:5001
+      PLUGIN_DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      INNER_API_KEY_FOR_PLUGIN: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      STORAGE_TYPE: opendal
+      OPENDAL_FS_ROOT: storage
+    volumes:
+      - ${WONTON_APP_DATA}/storage:/app/api/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/console/api/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+      start_interval: 3s
+
+  # Celery worker：知识库索引、工作流异步执行都靠它。
+  worker:
+    image: langgenius/dify-api:1.19.0@sha256:0d67842aedcb9b5884f75b88c4a5dd812e637916bff1ca892831f7ace2f3204f
+    user: "1001:1001"
+    environment:
+      MODE: worker
+      MIGRATION_ENABLED: "true"
+      SECRET_KEY: ${WONTON_SECRET_DIFY_SECRET_KEY}
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${WONTON_SECRET_POSTGRES_PASSWORD}
+      DB_DATABASE: dify
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+      CELERY_BROKER_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/1
+      SSRF_PROXY_HTTP_URL: http://ssrf-proxy:3128
+      SSRF_PROXY_HTTPS_URL: http://ssrf-proxy:3128
+      CODE_EXECUTION_ENDPOINT: http://sandbox:8194
+      CODE_EXECUTION_API_KEY: ${WONTON_SECRET_SANDBOX_API_KEY}
+      PLUGIN_DAEMON_URL: http://plugin-daemon:5002
+      PLUGIN_DAEMON_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
+      PLUGIN_DIFY_INNER_API_URL: http://api:5001
+      PLUGIN_DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      INNER_API_KEY_FOR_PLUGIN: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+      VECTOR_STORE: pgvector
+      PGVECTOR_HOST: pgvector
+      PGVECTOR_PORT: "5432"
+      PGVECTOR_USER: postgres
+      PGVECTOR_PASSWORD: ${WONTON_SECRET_PGVECTOR_PASSWORD}
+      PGVECTOR_DATABASE: dify
+      STORAGE_TYPE: opendal
+      OPENDAL_FS_ROOT: storage
+      MAIL_TYPE: smtp
+      SMTP_SERVER: ${WONTON_SMTP_HOST}
+      SMTP_PORT: ${WONTON_SMTP_PORT}
+      SMTP_USE_TLS: "false"
+      SMTP_OPPORTUNISTIC_TLS: "false"
+      MAIL_DEFAULT_SEND_FROM: ${WONTON_MAIL_FROM}
+    volumes:
+      - ${WONTON_APP_DATA}/storage:/app/api/storage
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      # 上游声明的就是这个检查，只是默认用 COMPOSE_WORKER_HEALTHCHECK_DISABLED 关着；这里打开。
+      # interval 给到 60s：每次检查都要起一个 Python 进程，别太频繁。
+      test: ["CMD-SHELL", "celery -A celery_healthcheck.celery inspect ping"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 120s
+      start_interval: 5s
+
+  # Celery beat：定时任务调度（工作流定时触发、清理任务）。celery beat 不响应 inspect ping，
+  # 用 PID 1 的进程身份做检查（entrypoint 里 exec 之后 PID 1 就是 beat）。
+  worker-beat:
+    image: langgenius/dify-api:1.19.0@sha256:0d67842aedcb9b5884f75b88c4a5dd812e637916bff1ca892831f7ace2f3204f
+    user: "1001:1001"
+    environment:
+      MODE: beat
+      # 数据库迁移只让 api 做（上游 worker 也显式关掉）；beat 开着会抢迁移锁，它的 redis 配置不全就撞 localhost。
+      MIGRATION_ENABLED: "false"
+      SECRET_KEY: ${WONTON_SECRET_DIFY_SECRET_KEY}
+      CELERY_BROKER_URL: redis://:${WONTON_SECRET_REDIS_PASSWORD}@redis:6379/1
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "grep -qa beat /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      start_interval: 3s
+
+  # 前端（Next.js）。CONSOLE_API_URL 留空 = 和控制台同源，经 nginx 同一个入口访问。
+  web:
+    image: langgenius/dify-web:1.19.0@sha256:f5f1ad000d6a268ae6b29b84c5095069fbd5994cbe43f937a3d32caa00038b4c
+    environment:
+      CONSOLE_API_URL: ""
+      APP_API_URL: ""
+      SERVER_CONSOLE_API_URL: http://api:5001
+      MARKETPLACE_API_URL: https://marketplace.dify.ai
+      MARKETPLACE_URL: https://marketplace.dify.ai
+      # 协同的 WebSocket 也走同源网关；上游默认 ws://localhost 只适合本机访问。
+      NEXT_PUBLIC_SOCKET_URL: ${WONTON_APP_URL}
+      # Next.js 独立服务读 HOSTNAME 当绑定地址，Docker 默认的 HOSTNAME 是容器名，只绑了容器 IP；
+      # 健康检查要打 127.0.0.1，显式绑全部网卡。上游没设这项（它没有健康检查，一直没人发现）。
+      HOSTNAME: 0.0.0.0
+    healthcheck:
+      # 首次打开前 web 的页面是「未初始化」错误页（500），注册管理员后才是 200；健康检查只证明 HTTP 在应答，
+      # 不挑状态码。镜像的 sh 是 dash，没有 /dev/tcp，用它自带的 node。
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(()=>process.exit(0),()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
       start_period: 30s
-      start_interval: 1s
+      start_interval: 2s
+
+  # 反向代理：web 和 api、websocket、插件回调在同一域名下按路径分流，网页入口指向它。
+  nginx:
+    image: nginx:1.31.8@sha256:165ddde8751e75a1c907d24ef10d9f6deb08b57e0fe56caf67512486aff76d82
+    entrypoint: ["/bin/bash", "/router-entrypoint.sh"]
+    environment:
+      NGINX_PORT: "80"
+      NGINX_SERVER_NAME: _
+      NGINX_WORKER_PROCESSES: auto
+      NGINX_KEEPALIVE_TIMEOUT: 65
+      NGINX_CLIENT_MAX_BODY_SIZE: 100M
+      NGINX_PROXY_READ_TIMEOUT: 3600s
+      NGINX_PROXY_SEND_TIMEOUT: 3600s
+      NGINX_SOCKET_IO_UPSTREAM: api-websocket:5001
+    configs:
+      - source: nginx-conf
+        target: /etc/nginx/nginx.conf.template
+      - source: nginx-proxy
+        target: /etc/nginx/proxy.conf.template
+      - source: nginx-site
+        target: /etc/nginx/conf.d/default.conf.template
+      - source: nginx-entrypoint
+        target: /router-entrypoint.sh
+    depends_on:
+      api:
+        condition: service_started
+      web:
+        condition: service_started
+    healthcheck:
+      # 镜像里有 curl（实测 1.31.8），发一个真实请求，2xx/3xx 都算通。
+      test: ["CMD-SHELL", "curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1/ | grep -qE '^2|^3'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
+
+  # 代码节点沙箱：跑用户写的 Python/Node 代码。外网请求经 ssrf-proxy（squid）。
+  sandbox:
+    image: langgenius/dify-sandbox:0.2.15@sha256:750e1111426ef31a9217b81c98cccfb750f17b182af3221102e420afa9f0928e
+    environment:
+      API_KEY: ${WONTON_SECRET_SANDBOX_API_KEY}
+      HTTP_PROXY: http://ssrf-proxy:3128
+      HTTPS_PROXY: http://ssrf-proxy:3128
+    volumes:
+      - ${WONTON_APP_DATA}/sandbox/dependencies:/dependencies
+    configs:
+      # 上游把这个 config.yaml 放在 docker/volumes/sandbox/conf/ 里随仓库分发，内容原样；
+      # key 会被环境变量 API_KEY 覆盖成核心生成的密钥，文件里不落密钥。
+      - source: sandbox-conf
+        target: /conf/config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8194/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+      start_interval: 2s
+
+  # 上游的 SSRF 代理：只放行公网目的地，代码节点和 HTTP 请求节点的出网经它过滤。
+  ssrf-proxy:
+    image: ubuntu/squid:6.6-24.04_beta@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
+    entrypoint: ["/bin/bash", "/squid-entrypoint.sh"]
+    environment:
+      HTTP_PORT: "3128"
+      COREDUMP_DIR: /var/spool/squid
+    configs:
+      - source: squid-conf
+        target: /etc/squid/squid.conf.template
+      - source: squid-common
+        target: /etc/squid/dify_common.conf.template
+      - source: squid-entrypoint
+        target: /squid-entrypoint.sh
+    healthcheck:
+      # squid 的 manager 页面只对本机开放，取一次 counters 证明代理在正常应答。
+      test: ["CMD-SHELL", "/bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/3128 && printf \"GET cache_object://localhost/counters HTTP/1.0\\r\\n\\r\\n\" >&3 && head -1 <&3 | grep -q \" 200 \"'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+      start_interval: 2s
+
+  # 插件守护进程：Dify 1.x 的模型供应商、工具都是装在这里的插件。它自己会建 dify_plugin 库。
+  plugin-daemon:
+    image: langgenius/dify-plugin-daemon:0.6.14-local@sha256:17ee86306a35c2c7e5910016f72e441c0252f0416bb9a845862088e9f8efa873
+    # 镜像里 dify 用户是 uid 1001（ubuntu:24.04 基础镜像自带 ubuntu 用户占了 1000，实测 docker run id 确认）。
+    user: "1001:1001"
+    environment:
+      DB_TYPE: postgresql
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${WONTON_SECRET_POSTGRES_PASSWORD}
+      DB_DATABASE: dify_plugin
+      DB_SSL_MODE: disable
+      SERVER_KEY: ${WONTON_SECRET_PLUGIN_DAEMON_KEY}
+      SERVER_PORT: "5002"
+      # 上游 defaults 里三项：守护进程记录"远程安装宿主"用的地址和端口，Go 端没默认值，缺了起不来（实测报
+      # "plugin remote installing host is empty"）；working path 同理（报 "plugin working path is empty"）。
+      # 0.0.0.0 是上游 PLUGIN_DEBUGGING_HOST 的默认。
+      PLUGIN_REMOTE_INSTALLING_HOST: 0.0.0.0
+      PLUGIN_REMOTE_INSTALLING_PORT: "5003"
+      PLUGIN_WORKING_PATH: /app/storage/cwd
+      # 上游经 env_file 的 databases/redis.env 给它；没有这几项它按空主机名去连 redis（实测 dial tcp :0）。
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${WONTON_SECRET_REDIS_PASSWORD}
+      DIFY_INNER_API_URL: http://api:5001
+      DIFY_INNER_API_KEY: ${WONTON_SECRET_PLUGIN_INNER_API_KEY}
+    volumes:
+      - ${WONTON_APP_DATA}/plugin:/app/storage
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:5002/health/check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 2s
 
 configs:
-  site:
-    file: web/default.conf.template
-  page:
-    file: web/index.html
-  tokens:
-    file: web/tokens.css
+  nginx-conf:
+    file: ./nginx/nginx.conf.template
+  nginx-proxy:
+    file: ./nginx/proxy.conf.template
+  nginx-site:
+    file: ./nginx/default.conf.template
+  nginx-entrypoint:
+    file: ./nginx/entrypoint.sh
+  squid-conf:
+    file: ./squid/squid.conf.template
+  squid-common:
+    file: ./squid/common.conf.template
+  squid-entrypoint:
+    file: ./squid/entrypoint.sh
+  sandbox-conf:
+    content: |
+      app:
+        port: 8194
+        debug: True
+        key: dify-sandbox
+      max_workers: 4
+      max_requests: 50
+      worker_timeout: 5
+      enable_network: True # please make sure there is no network risk in your environment
+      allowed_syscalls: # please leave it empty if you have no idea how seccomp works
+      proxy:
+        socks5: ''
+        http: ''
+        https: ''
 
 x-wonton:
-  spec: "0.6"
-  # 换成你自己的：反向域名形式，装上以后不能改。
-  id: app.example.hello
-  version: 0.1.1
+  spec: "0.12"
+  id: ai.dify.dify
+  version: 0.1.0
   kind: app
-  title: { zh: 你好, en: Hello }
-  description: { zh: 向登录的人问好的示例网页, en: An example page that greets whoever is signed in }
+  title: { zh: AI 应用工坊（Dify）, en: AI App Builder (Dify) }
+  description:
+    zh: 像搭积木一样做出自己的 AI 助手：把提示词、知识库和工具拼成应用，家人在网页上就能用。
+    en: "Build your own AI assistants like building blocks: combine prompts, knowledge and tools into apps the family can use in the browser."
   icon: icon.svg
   notices: [NOTICE]
-  screenshots: [screenshots/home.png]
-  author: { name: Example }
-  homepage: https://nginx.org
-  # 应用（这里是 nginx）的许可证；插件包自己的许可证写在仓库的 LICENSE 里。
-  license: BSD-2-Clause
+  author: { name: geraldpeng6, url: https://github.com/geraldpeng6 }
+  homepage: https://dify.ai
+  # Dify 是改过的 Apache-2.0（多租户 SaaS 和去掉 LOGO 需商业授权），SPDX 没有现成标识，用 LicenseRef，全文在 NOTICE。
+  license: LicenseRef-Dify-Modified-Apache-2.0
   tags:
-    zh: [工具]
-    en: [Tools]
+    zh: [AI, 知识库, 效率]
+    en: [AI, Knowledge base, Productivity]
   about:
     zh: |
-      一个示例网页：登录以后，页面会向你问好。新建插件时可以照着改。
+      在自己家里搭 AI 应用：像搭积木一样把提示词、知识库和工具拼起来，做出问答机器人、文档助手这些应用，做好后在网页上直接用，不用写代码。
+
+      常见用法：上传一堆文档做「问自己的资料」的客服机器人；拖几个节点搭一条流程，让 AI 读网页、写摘要、存结果。
+
+      第一次打开按提示注册管理员账号。模型要自己添加：设置 → 模型供应商里选一家，或用兼容 OpenAI 接口的地址（装好后在「插件」里已备好 OpenAI-API-compatible 这个供应商）。整个平台加上自带组件吃内存，建议留给它 4GB。
     en: |
-      An example page: once you are signed in, the page says hello. Copy it as a starting point for a new plugin.
-  release_notes: { zh: 名字和说明更新。, en: Product name and description update. }
+      Build AI apps at home: snap together prompts, knowledge bases and tools to make Q&A bots and document assistants, then use them in the browser — no code needed.
+
+      Common uses: upload documents to get a bot that answers from your own files; drag a few nodes into a workflow that reads pages, writes summaries and saves results.
+
+      Open the app once and register an admin account. Models are added by you: Settings → Model Provider, or point the bundled OpenAI-API-compatible provider (installed under Plugins) at any OpenAI-compatible endpoint. The platform plus its bundled components are memory-hungry; budget about 4 GB.
+  release_notes:
+    zh: 首个版本：基于上游 Dify 1.19.0。
+    en: "Initial release: based on upstream Dify 1.19.0."
+  setup:
+    zh: 第一次打开会进入安装页，用邮箱注册管理员账号，然后到「设置 → 模型供应商」添加你要用的模型。
+    en: "The first open lands on the install page: register the admin account with your email, then add your models under Settings → Model Provider."
   webui:
-    service: web
+    service: nginx
     port: 80
-    # 示例页回显网关注入的用户名，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#网关代登录sso-proxy。
-    sso: proxy
-    proxy:
-      headers:
-        Remote-User: "{user}"
-  # 能放进侧边栏“我的应用”的页面，见 https://github.com/wontonapp/wonton-docs/blob/main/plugin-spec.md#应用页面tabs。放不放由用户决定。
-  tabs:
-    - id: home
-      title: { zh: 主页, en: Home }
-      icon: tabs/home.svg
-      icon_selected: tabs/home-fill.svg
-      path: /
-      # 这个页面没做适配，用默认的 inset：从状态栏下沿开始，页面不用管安全区。
-      # 想让内容从状态栏后面滚过，写 layout: edge-to-edge，并用 --wonton-inset-* 留出系统安全区的位置。
-  permissions: []
-  # 上游 nginx 官方镜像，amd64 和 arm64 都有；上游没写最低内存，按本机空闲实测取整（实测约 24M，取 64M）。
+    sso: none
+  permissions:
+    # 市场装插件、模型和工具调用都要出网。
+    # Marketplace downloads and model/tool calls need outbound network.
+    - network.egress
+    # 邀请成员、找回密码的邮件经核心的发信服务。
+    # Invite and password-reset mail goes through the core mail relay.
+    - notify
+  secrets:
+    dify_secret_key:
+      generate: { bytes: 48 }
+    postgres_password:
+      generate: { bytes: 24 }
+    redis_password:
+      generate: { bytes: 24 }
+    pgvector_password:
+      generate: { bytes: 24 }
+    plugin_daemon_key:
+      generate: { bytes: 32 }
+    plugin_inner_api_key:
+      generate: { bytes: 32 }
+    sandbox_api_key:
+      generate: { bytes: 32 }
   requirements:
     arch: [amd64, arm64]
-    memory: 64M
+    # 上游官方文档的最低要求（docs.dify.ai：2 核 / 4GB）；空闲实测见 PR。
+    memory: 4G
